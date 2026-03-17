@@ -150,8 +150,6 @@ call_hierarchy("PaymentService", "processPayment", direction="callers", depth=2)
 ./gradlew buildPlugin   # 构建插件 zip
 ```
 
-详细架构说明和踩坑记录见 [开发文档](jetbrains-code-navigator-mcp-plugin-dev-guide.md) 和 [CLAUDE.md](CLAUDE.md)。
-
 ## 兼容性
 
 | IDE 版本 | 支持 |
