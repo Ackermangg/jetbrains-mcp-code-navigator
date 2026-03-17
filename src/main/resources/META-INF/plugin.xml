@@ -1,0 +1,25 @@
+<idea-plugin>
+    <id>com.codenavigatormcp</id>
+    <name>Code Navigator MCP</name>
+    <version>1.0.0</version>
+    <vendor>Developer</vendor>
+
+    <description><![CDATA[
+        Exposes Java code navigation tools (go to definition, find references,
+        call hierarchy, method body retrieval) via MCP protocol for AI coding assistants.
+    ]]></description>
+
+    <!-- Dependencies -->
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
+    <depends>com.intellij.mcpServer</depends>
+
+    <!-- MCP Tool Registration -->
+    <extensions defaultExtensionNs="com.intellij.mcpServer">
+        <mcpTool implementation="com.codenavigatormcp.tools.GetMethodBodyTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.GoToDefinitionTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.FindReferencesTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.GetClassStructureTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.CallHierarchyTool"/>
+    </extensions>
+</idea-plugin>

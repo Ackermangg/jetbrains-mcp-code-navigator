@@ -1,0 +1,24 @@
+# Claude & dev guide (private)
+CLAUDE.md
+jetbrains-code-navigator-mcp-plugin-dev-guide.md
+
+# Claude Code local settings
+.claude/
+
+# IntelliJ Platform Gradle plugin cache
+.intellijPlatform/
+
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# OS
+.DS_Store
+Thumbs.db
