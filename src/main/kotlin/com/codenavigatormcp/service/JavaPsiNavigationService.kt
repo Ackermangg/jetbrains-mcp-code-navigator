@@ -6,6 +6,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.psi.*
 import com.intellij.psi.search.GlobalSearchScope
+import com.intellij.psi.search.PsiShortNamesCache
 import com.intellij.psi.search.searches.ReferencesSearch
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.util.Processor
@@ -33,16 +34,7 @@ class JavaPsiNavigationService(private val project: Project) {
         }
 
         val targetMethods = if (parameterTypes != null) {
-            val filtered = methods.filter { method ->
-                method.parameterList.parameters.map { it.type.presentableText } == parameterTypes
-            }
-            if (filtered.isEmpty()) {
-                throw IllegalArgumentException(
-                    "No overload of '$methodName' matches parameter types $parameterTypes. " +
-                    "Available overloads: ${methods.map { m -> m.parameterList.parameters.map { it.type.presentableText } }}"
-                )
-            }
-            filtered
+            resolveMethodOverloads(methodName, methods, parameterTypes)
         } else {
             methods
         }
@@ -90,7 +82,7 @@ class JavaPsiNavigationService(private val project: Project) {
                 append(",\"returnType\":\"${PsiUtils.jsonEscape(method.returnType?.presentableText ?: "void")}\"")
                 append(",\"parameters\":[")
                 append(method.parameterList.parameters.joinToString(",") { p ->
-                    "{\"name\":\"${PsiUtils.jsonEscape(p.name ?: "")}\",\"type\":\"${PsiUtils.jsonEscape(p.type.presentableText)}\"}"
+                    "{\"name\":\"${PsiUtils.jsonEscape(p.name)}\",\"type\":\"${PsiUtils.jsonEscape(p.type.presentableText)}\"}"
                 })
                 append("]")
             }
@@ -100,16 +92,77 @@ class JavaPsiNavigationService(private val project: Project) {
     }
 
     private fun buildSignatureString(method: PsiMethod): String {
-        val modifiers = PsiUtils.getModifiers(method).joinToString(" ")
-        val returnType = method.returnType?.presentableText ?: ""
-        val params = method.parameterList.parameters.joinToString(", ") {
-            "${it.type.presentableText} ${it.name ?: ""}"
+        return PsiUtils.getElementSignature(method)
+    }
+
+    private fun resolveMethodOverloads(
+        methodName: String,
+        methods: List<PsiMethod>,
+        parameterTypes: List<String>
+    ): List<PsiMethod> {
+        val exactMatches = methods.filter { method ->
+            method.parameterList.parameters.map { it.type.presentableText } == parameterTypes
         }
-        val parts = mutableListOf<String>()
-        if (modifiers.isNotEmpty()) parts.add(modifiers)
-        if (returnType.isNotEmpty()) parts.add(returnType)
-        parts.add("${method.name}($params)")
-        return parts.joinToString(" ")
+        if (exactMatches.isNotEmpty()) return exactMatches
+
+        val normalizedInput = parameterTypes.map(::normalizeTypeForComparison)
+        val normalizedMatches = methods.filter { method ->
+            method.parameterList.parameters.map { normalizeTypeForComparison(it.type.presentableText) } == normalizedInput
+        }
+        if (normalizedMatches.size == 1) return normalizedMatches
+
+        val erasedInput = parameterTypes.map(::eraseGenericTypeForComparison)
+        val erasedMatches = methods.filter { method ->
+            method.parameterList.parameters.map { eraseGenericTypeForComparison(it.type.presentableText) } == erasedInput
+        }
+        if (erasedMatches.size == 1) return erasedMatches
+
+        throw IllegalArgumentException(buildMethodMatchError(methodName, parameterTypes, methods, normalizedMatches, erasedMatches))
+    }
+
+    private fun buildMethodMatchError(
+        methodName: String,
+        parameterTypes: List<String>,
+        methods: List<PsiMethod>,
+        normalizedMatches: List<PsiMethod>,
+        erasedMatches: List<PsiMethod>
+    ): String {
+        val availableOverloads = methods.joinToString("; ") { buildSignatureString(it) }
+        val reason = when {
+            normalizedMatches.size > 1 -> {
+                "Multiple overloads of '$methodName' match normalized parameter types $parameterTypes"
+            }
+            erasedMatches.size > 1 -> {
+                "Multiple overloads of '$methodName' match erased parameter types $parameterTypes"
+            }
+            else -> {
+                "No overload of '$methodName' matches parameter types $parameterTypes"
+            }
+        }
+        return "$reason. Available overloads: $availableOverloads. " +
+            "Tip: omit parameterTypes to return all overloads, or inspect candidates with get_class_structure / find_symbol first."
+    }
+
+    private fun normalizeTypeForComparison(typeText: String): String {
+        val noWhitespace = typeText.replace(Regex("\\s+"), "")
+        val normalizedVarargs = noWhitespace.replace("...", "[]")
+        return normalizedVarargs.replace(Regex("(?<![\\w$])(?:[A-Za-z_$][\\w$]*\\.)+([A-Za-z_$][\\w$]*)")) {
+            it.groupValues[1]
+        }
+    }
+
+    private fun eraseGenericTypeForComparison(typeText: String): String {
+        val normalized = normalizeTypeForComparison(typeText)
+        val sb = StringBuilder()
+        var depth = 0
+        for (ch in normalized) {
+            when (ch) {
+                '<' -> depth++
+                '>' -> depth = (depth - 1).coerceAtLeast(0)
+                else -> if (depth == 0) sb.append(ch)
+            }
+        }
+        return sb.toString()
     }
 
     // ===== GoToDefinition =====
@@ -159,9 +212,35 @@ class JavaPsiNavigationService(private val project: Project) {
 
             throw IllegalArgumentException("Symbol '$symbolName' not found in class '$contextClass'")
         } else {
-            val psiClass = PsiUtils.findClass(project, symbolName)
+            val psiClass = resolveClassForDefinition(symbolName)
             buildDefinitionJson(psiClass)
         }
+    }
+
+    private fun resolveClassForDefinition(symbolName: String): PsiClass {
+        if (symbolName.contains('.')) {
+            return PsiUtils.findClass(project, symbolName)
+        }
+
+        val cache = PsiShortNamesCache.getInstance(project)
+        val allCandidates = cache.getClassesByName(symbolName, GlobalSearchScope.allScope(project))
+            .distinctBy { it.qualifiedName ?: it.name ?: "" }
+
+        if (allCandidates.isEmpty()) {
+            throw IllegalArgumentException("Class not found: $symbolName")
+        }
+        if (allCandidates.size == 1) {
+            return allCandidates[0]
+        }
+
+        val formattedCandidates = allCandidates.joinToString("; ") {
+            val filePath = it.containingFile?.virtualFile?.let { file -> PsiUtils.toProjectRelativePath(project, file) } ?: ""
+            "${it.qualifiedName ?: it.name ?: symbolName} [$filePath]"
+        }
+        throw IllegalArgumentException(
+            "Class name '$symbolName' is ambiguous. Candidates: $formattedCandidates. " +
+                "Use a fully-qualified class name or call find_symbol first."
+        )
     }
 
     private fun resolveElement(element: PsiElement): PsiElement? {
@@ -208,7 +287,7 @@ class JavaPsiNavigationService(private val project: Project) {
             is PsiParameter -> {
                 val method = PsiTreeUtil.getParentOfType(element, PsiMethod::class.java)
                 arrayOf(
-                    element.name ?: "",
+                    element.name,
                     "parameter",
                     method?.containingClass?.qualifiedName ?: "",
                     "${element.type.presentableText} ${element.name}"
@@ -229,6 +308,131 @@ class JavaPsiNavigationService(private val project: Project) {
             append("\"signature\":\"${PsiUtils.jsonEscape(signature)}\"")
             append("}")
         }
+    }
+
+    // ===== FindSymbol =====
+
+    fun findSymbol(
+        symbolName: String,
+        symbolKinds: List<String>?,
+        contextClass: String?,
+        includeDependencies: Boolean,
+        maxResults: Int
+    ): String = runReadAction {
+        val effectiveKinds = parseSymbolKinds(symbolKinds)
+        val effectiveMax = maxResults.coerceIn(1, 100)
+        val contextPsiClass = contextClass?.let { PsiUtils.findClass(project, it, includeDependencies) }
+        val candidates = LinkedHashMap<String, PsiNamedElement>()
+
+        if ("class" in effectiveKinds) {
+            collectClassCandidates(symbolName, includeDependencies, candidates)
+        }
+        if ("method" in effectiveKinds) {
+            collectMethodCandidates(symbolName, contextPsiClass, includeDependencies, candidates)
+        }
+        if ("field" in effectiveKinds) {
+            collectFieldCandidates(symbolName, contextPsiClass, includeDependencies, candidates)
+        }
+
+        val sortedCandidates = candidates.values
+            .sortedWith(compareByDescending<PsiNamedElement> { isExactContextMatch(it, contextPsiClass) }
+                .thenByDescending { isProjectElement(it) }
+                .thenBy { PsiUtils.getSymbolKind(it as PsiElement) }
+                .thenBy { it.name ?: "" }
+                .thenBy { PsiUtils.getQualifiedName(it) ?: "" })
+            .take(effectiveMax)
+
+        buildString {
+            append("{")
+            append("\"symbolName\":\"${PsiUtils.jsonEscape(symbolName)}\",")
+            append("\"returnedCount\":${sortedCandidates.size},")
+            append("\"candidates\":[${sortedCandidates.joinToString(",") { PsiUtils.buildSymbolCandidateJson(project, it) }}]")
+            append("}")
+        }
+    }
+
+    private fun parseSymbolKinds(symbolKinds: List<String>?): Set<String> {
+        if (symbolKinds.isNullOrEmpty()) return setOf("class", "method", "field")
+        val effectiveKinds = symbolKinds.map { it.lowercase() }.toSet()
+        val invalidKinds = effectiveKinds - setOf("class", "method", "field")
+        if (invalidKinds.isNotEmpty()) {
+            throw IllegalArgumentException("Invalid symbolKinds: ${invalidKinds.joinToString(", ")}")
+        }
+        return effectiveKinds
+    }
+
+    private fun collectClassCandidates(
+        symbolName: String,
+        includeDependencies: Boolean,
+        candidates: MutableMap<String, PsiNamedElement>
+    ) {
+        val classScope = if (includeDependencies) GlobalSearchScope.allScope(project) else GlobalSearchScope.projectScope(project)
+        if (symbolName.contains('.')) {
+            JavaPsiFacade.getInstance(project).findClass(symbolName, classScope)?.let { candidate ->
+                candidates.putIfAbsent(PsiUtils.getQualifiedName(candidate) ?: candidate.name ?: symbolName, candidate)
+            }
+            return
+        }
+
+        PsiShortNamesCache.getInstance(project)
+            .getClassesByName(symbolName, classScope)
+            .forEach { candidate ->
+                candidates.putIfAbsent(PsiUtils.getQualifiedName(candidate) ?: candidate.name ?: symbolName, candidate)
+            }
+    }
+
+    private fun collectMethodCandidates(
+        symbolName: String,
+        contextPsiClass: PsiClass?,
+        includeDependencies: Boolean,
+        candidates: MutableMap<String, PsiNamedElement>
+    ) {
+        if (contextPsiClass != null) {
+            contextPsiClass.findMethodsByName(symbolName, false).forEach { method ->
+                candidates.putIfAbsent(PsiUtils.getQualifiedName(method) ?: method.name, method)
+            }
+            return
+        }
+
+        val scope = if (includeDependencies) GlobalSearchScope.allScope(project) else GlobalSearchScope.projectScope(project)
+        PsiShortNamesCache.getInstance(project)
+            .getMethodsByName(symbolName, scope)
+            .forEach { method ->
+                candidates.putIfAbsent(PsiUtils.getQualifiedName(method) ?: method.name, method)
+            }
+    }
+
+    private fun collectFieldCandidates(
+        symbolName: String,
+        contextPsiClass: PsiClass?,
+        includeDependencies: Boolean,
+        candidates: MutableMap<String, PsiNamedElement>
+    ) {
+        if (contextPsiClass != null) {
+            contextPsiClass.fields
+                .filter { it.name == symbolName }
+                .forEach { field ->
+                    candidates.putIfAbsent(PsiUtils.getQualifiedName(field) ?: field.name, field)
+                }
+            return
+        }
+
+        val scope = if (includeDependencies) GlobalSearchScope.allScope(project) else GlobalSearchScope.projectScope(project)
+        PsiShortNamesCache.getInstance(project)
+            .getFieldsByName(symbolName, scope)
+            .forEach { field ->
+                candidates.putIfAbsent(PsiUtils.getQualifiedName(field) ?: field.name, field)
+            }
+    }
+
+    private fun isExactContextMatch(element: PsiNamedElement, contextPsiClass: PsiClass?): Boolean {
+        if (contextPsiClass == null) return false
+        return PsiUtils.getContainingClassName(element as PsiElement) == (contextPsiClass.qualifiedName ?: contextPsiClass.name)
+    }
+
+    private fun isProjectElement(element: PsiNamedElement): Boolean {
+        val psiElement = element as PsiElement
+        return PsiUtils.isProjectFile(project, psiElement.containingFile?.virtualFile)
     }
 
     // ===== FindReferences =====

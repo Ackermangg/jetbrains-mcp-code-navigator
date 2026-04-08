@@ -16,6 +16,7 @@
 
     <!-- MCP Tool Registration -->
     <extensions defaultExtensionNs="com.intellij.mcpServer">
+        <mcpTool implementation="com.codenavigatormcp.tools.FindSymbolTool"/>
         <mcpTool implementation="com.codenavigatormcp.tools.GetMethodBodyTool"/>
         <mcpTool implementation="com.codenavigatormcp.tools.GoToDefinitionTool"/>
         <mcpTool implementation="com.codenavigatormcp.tools.FindReferencesTool"/>

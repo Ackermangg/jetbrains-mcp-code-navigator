@@ -22,7 +22,8 @@ class GetMethodBodyTool : AbstractMcpTool<GetMethodBodyArgs>(GetMethodBodyArgs.s
         Get the body of a specific Java method by class name and method name.
         Use this instead of reading entire large files - only returns the target method code.
         Set includeBody=false to get only the method signature (saves tokens).
-        Use parameterTypes to disambiguate overloaded methods.
+        parameterTypes is optional: if omitted and multiple overloads exist, all overloads are returned.
+        Use parameterTypes to disambiguate overloaded methods when you know the signature.
         className accepts both short name (e.g. "MyService") and fully-qualified name (e.g. "com.example.MyService").
     """.trimIndent()
 

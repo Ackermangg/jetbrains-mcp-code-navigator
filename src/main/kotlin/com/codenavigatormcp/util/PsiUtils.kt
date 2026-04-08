@@ -6,17 +6,26 @@ import com.intellij.psi.*
 import com.intellij.psi.javadoc.PsiDocComment
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.PsiShortNamesCache
+import com.intellij.psi.util.PsiTreeUtil
 
 object PsiUtils {
 
     fun findClass(project: Project, className: String): PsiClass {
+        return findClass(project, className, includeDependencies = true)
+    }
+
+    fun findClass(project: Project, className: String, includeDependencies: Boolean): PsiClass {
         // allScope includes Maven/Gradle dependency JARs in addition to project sources
-        val allScope = GlobalSearchScope.allScope(project)
+        val scope = if (includeDependencies) {
+            GlobalSearchScope.allScope(project)
+        } else {
+            GlobalSearchScope.projectScope(project)
+        }
 
         // Try fully-qualified name first (works for both project classes and dependency classes)
-        JavaPsiFacade.getInstance(project).findClass(className, allScope)?.let { return it }
+        JavaPsiFacade.getInstance(project).findClass(className, scope)?.let { return it }
 
-        // Fallback to short name: restrict to project scope to avoid ambiguity across dependency JARs
+        // Fallback to short name: use project scope to avoid ambiguity across dependency JARs
         val classes = PsiShortNamesCache.getInstance(project)
             .getClassesByName(className, GlobalSearchScope.projectScope(project))
         if (classes.isNotEmpty()) return classes[0]
@@ -52,6 +61,15 @@ object PsiUtils {
         }
     }
 
+    fun isProjectFile(project: Project, file: VirtualFile?): Boolean {
+        if (file == null) return false
+        return GlobalSearchScope.projectScope(project).contains(file)
+    }
+
+    fun getSourceType(project: Project, file: VirtualFile?): String {
+        return if (isProjectFile(project, file)) "project" else "dependency"
+    }
+
     fun getModifiers(member: PsiModifierListOwner): List<String> {
         val modifiers = mutableListOf<String>()
         val modifierList = member.modifierList ?: return modifiers
@@ -72,6 +90,82 @@ object PsiUtils {
         val className = method.containingClass?.name ?: "Unknown"
         val params = method.parameterList.parameters.joinToString(", ") { it.type.presentableText }
         return "$className.${method.name}($params)"
+    }
+
+    fun getSymbolKind(element: PsiElement): String = when (element) {
+        is PsiClass -> "class"
+        is PsiMethod -> "method"
+        is PsiField -> "field"
+        is PsiParameter -> "parameter"
+        else -> "unknown"
+    }
+
+    fun getContainingClassName(element: PsiElement): String? = when (element) {
+        is PsiClass -> element.qualifiedName ?: element.name
+        is PsiMember -> element.containingClass?.qualifiedName ?: element.containingClass?.name
+        is PsiParameter -> PsiTreeUtil.getParentOfType(element, PsiMethod::class.java)
+            ?.containingClass?.qualifiedName
+        else -> null
+    }
+
+    fun getQualifiedName(element: PsiNamedElement): String? {
+        return when (element) {
+            is PsiClass -> element.qualifiedName ?: element.name
+            is PsiMethod -> {
+                val containingClass = getContainingClassName(element) ?: return null
+                val params = element.parameterList.parameters.joinToString(",") { it.type.presentableText }
+                "$containingClass#${element.name}($params)"
+            }
+            is PsiField -> {
+                val containingClass = getContainingClassName(element) ?: return null
+                "$containingClass#${element.name}"
+            }
+            else -> element.name
+        }
+    }
+
+    fun getElementSignature(element: PsiNamedElement): String = when (element) {
+        is PsiMethod -> {
+            val modifiers = getModifiers(element).joinToString(" ")
+            val returnType = element.returnType?.presentableText ?: ""
+            val params = element.parameterList.parameters.joinToString(", ") {
+                "${it.type.presentableText} ${it.name}"
+            }
+            listOfNotNull(
+                modifiers.ifEmpty { null },
+                returnType.ifEmpty { null },
+                "${element.name}($params)"
+            ).joinToString(" ")
+        }
+        is PsiField -> "${element.type.presentableText} ${element.name}"
+        is PsiClass -> element.qualifiedName ?: element.name ?: ""
+        is PsiParameter -> "${element.type.presentableText} ${element.name}".trim()
+        else -> element.name ?: ""
+    }
+
+    fun buildSymbolCandidateJson(project: Project, element: PsiNamedElement): String {
+        val psiElement = element as PsiElement
+        val file = psiElement.containingFile?.virtualFile
+        val filePath = file?.let { toProjectRelativePath(project, it) } ?: ""
+        val line = getLineNumber(psiElement)
+        val symbolKind = getSymbolKind(psiElement)
+        val containingClass = getContainingClassName(psiElement) ?: ""
+        val qualifiedName = getQualifiedName(element) ?: ""
+        val signature = getElementSignature(element)
+        val sourceType = getSourceType(project, file)
+
+        return buildString {
+            append("{")
+            append("\"symbolKind\":\"${jsonEscape(symbolKind)}\",")
+            append("\"name\":\"${jsonEscape(element.name ?: "")}\",")
+            append("\"containingClass\":\"${jsonEscape(containingClass)}\",")
+            append("\"qualifiedName\":\"${jsonEscape(qualifiedName)}\",")
+            append("\"signature\":\"${jsonEscape(signature)}\",")
+            append("\"filePath\":\"${jsonEscape(filePath)}\",")
+            append("\"line\":$line,")
+            append("\"sourceType\":\"$sourceType\"")
+            append("}")
+        }
     }
 
     fun extractJavadocSummary(docComment: PsiDocComment): String? {

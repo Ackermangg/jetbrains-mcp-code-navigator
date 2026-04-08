@@ -1,6 +1,6 @@
 # Code Navigator MCP Plugin
 
-IntelliJ IDEA 插件，基于 IDEA 的 PSI（Program Structure Interface）代码分析引擎，通过 MCP 协议向 AI 编码助手暴露 5 个精准的 Java 代码导航工具。
+IntelliJ IDEA 插件，基于 IDEA 的 PSI（Program Structure Interface）代码分析引擎，通过 MCP 协议向 AI 编码助手暴露 6 个精准的 Java 代码导航工具。
 
 ## 解决的问题
 
@@ -31,6 +31,17 @@ get_class_structure("org.springframework.kafka.core.KafkaTemplate")
 
 ## 工具列表
 
+### `find_symbol`
+按符号名搜索 Java 类、方法或字段，返回候选定义列表，适合快速定位尚未确定文件位置的目标。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `symbolName` | string | ✅ | 符号名 |
+| `symbolKinds` | string[] | — | 限定搜索类型：`class` / `method` / `field`，默认全部 |
+| `contextClass` | string | — | 已知宿主类时用于收窄方法/字段候选 |
+| `includeDependencies` | boolean | — | 是否包含 Maven/Gradle 依赖，默认 `true` |
+| `maxResults` | int | — | 返回上限，默认 20，最大 100 |
+
 ### `get_method_body`
 获取指定 Java 方法的代码体。只返回目标方法，而非整个文件。**支持项目源码和 Maven 依赖 JAR 中的类。**
 
@@ -40,7 +51,7 @@ get_class_structure("org.springframework.kafka.core.KafkaTemplate")
 | `methodName` | string | ✅ | 方法名 |
 | `includeBody` | boolean | — | 是否包含方法体，默认 `true`；设为 `false` 仅返回签名 |
 | `includeJavadoc` | boolean | — | 是否包含 Javadoc，默认 `true` |
-| `parameterTypes` | string[] | — | 参数类型列表，用于区分重载方法 |
+| `parameterTypes` | string[] | — | 参数类型列表，用于区分重载方法；不传则返回所有同名重载 |
 
 ### `go_to_definition`
 跳转到符号定义，返回文件路径、行号、符号类型和签名。支持两种模式：
@@ -48,7 +59,7 @@ get_class_structure("org.springframework.kafka.core.KafkaTemplate")
 | 模式 | 参数 | 说明 |
 |------|------|------|
 | 按位置 | `filePath` + `line` + `column` | 解析指定坐标处的符号 |
-| 按名称 | `symbolName` [+ `contextClass`] | 按名称查找定义 |
+| 按名称 | `symbolName` [+ `contextClass`] | 查找类定义，或在已知类中查找成员定义 |
 
 ### `find_references`
 查找 Java 类、方法或字段的所有引用，每条结果包含文件路径、行号、所在类/方法和代码片段。
@@ -124,11 +135,26 @@ cd jetbrains-mcp-code-navigator
 
 `@jetbrains/mcp-proxy` 会自动发现运行中的 IDEA 实例并桥接 MCP 协议。
 
+## 推荐工作流
+
+- 已知类或方法：优先用 `get_class_structure` 或 `get_method_body`
+- 只知道符号名、不确定定义位置：先用 `find_symbol`
+- 已知调用点坐标：再用 `go_to_definition`
+- 需要追踪谁在用它：用 `find_references` 或 `call_hierarchy`
+
+`search_in_files_content` 更适合纯文本场景，不推荐作为 Java 语义定位的首选工具。
+
 ## 使用示例
 
 ```
+# 先按名称找候选定义，再决定读哪个类/方法
+find_symbol("GenericQueryUtil", symbolKinds=["class"])
+
 # 只读取目标方法，不加载整个文件
 get_method_body("StowageProcessService", "clearStowageByWaybillReport")
+
+# 不传 parameterTypes 时，返回所有同名重载
+get_method_body("OrderService", "createOrder", includeBody=false)
 
 # 读取 Maven 依赖 JAR 中的方法实现
 get_method_body("cn.hutool.core.util.StrUtil", "isEmptyIfStr")

@@ -21,7 +21,8 @@ class GoToDefinitionTool : AbstractMcpTool<GoToDefinitionArgs>(GoToDefinitionArg
     override val description: String = """
         Navigate to the definition of a symbol. Supports two modes:
         1. Position-based: provide filePath + line + column to resolve the symbol at that location.
-        2. Name-based: provide symbolName (and optionally contextClass) to find the definition by name.
+        2. Name-based: provide symbolName and optionally contextClass to find a class definition or a member inside a known class.
+        For dependency classes, prefer a fully-qualified class name. If a short class name is ambiguous, use find_symbol first.
         Returns the definition's file path, line number, symbol kind, and signature.
     """.trimIndent()
 
