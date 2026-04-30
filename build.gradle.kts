@@ -27,8 +27,7 @@ intellijPlatform {
         name = "Code Navigator MCP"
         version = providers.gradleProperty("pluginVersion").get()
         description = """
-            Exposes Java code navigation tools (go to definition, find references,
-            call hierarchy, method body retrieval) via MCP protocol for AI coding assistants.
+            Exposes compact Java code navigation tools via MCP protocol for AI coding assistants.
         """.trimIndent()
         vendor {
             name = "Developer"

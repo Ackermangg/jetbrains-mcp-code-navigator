@@ -5,8 +5,7 @@
     <vendor>Developer</vendor>
 
     <description><![CDATA[
-        Exposes Java code navigation tools (go to definition, find references,
-        call hierarchy, method body retrieval) via MCP protocol for AI coding assistants.
+        Exposes compact Java code navigation tools via MCP protocol for AI coding assistants.
     ]]></description>
 
     <!-- Dependencies -->
@@ -16,11 +15,8 @@
 
     <!-- MCP Tool Registration -->
     <extensions defaultExtensionNs="com.intellij.mcpServer">
-        <mcpTool implementation="com.codenavigatormcp.tools.FindSymbolTool"/>
-        <mcpTool implementation="com.codenavigatormcp.tools.GetMethodBodyTool"/>
-        <mcpTool implementation="com.codenavigatormcp.tools.GoToDefinitionTool"/>
-        <mcpTool implementation="com.codenavigatormcp.tools.FindReferencesTool"/>
-        <mcpTool implementation="com.codenavigatormcp.tools.GetClassStructureTool"/>
-        <mcpTool implementation="com.codenavigatormcp.tools.CallHierarchyTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.JavaResolveTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.JavaInspectTool"/>
+        <mcpTool implementation="com.codenavigatormcp.tools.JavaUsageTool"/>
     </extensions>
 </idea-plugin>

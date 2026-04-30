@@ -39,10 +39,14 @@ class JavaPsiNavigationService(private val project: Project) {
             methods
         }
 
-        if (targetMethods.size == 1) {
-            buildMethodJson(targetMethods[0], psiClass, includeBody, includeJavadoc)
-        } else {
-            "[${targetMethods.joinToString(",") { buildMethodJson(it, psiClass, includeBody, includeJavadoc) }}]"
+        buildString {
+            append("{")
+            append("\"operation\":\"method_body\",")
+            append("\"className\":\"${PsiUtils.jsonEscape(psiClass.qualifiedName ?: psiClass.name ?: className)}\",")
+            append("\"methodName\":\"${PsiUtils.jsonEscape(methodName)}\",")
+            append("\"returnedCount\":${targetMethods.size},")
+            append("\"methods\":[${targetMethods.joinToString(",") { buildMethodJson(it, psiClass, includeBody, includeJavadoc) }}]")
+            append("}")
         }
     }
 
@@ -140,7 +144,7 @@ class JavaPsiNavigationService(private val project: Project) {
             }
         }
         return "$reason. Available overloads: $availableOverloads. " +
-            "Tip: omit parameterTypes to return all overloads, or inspect candidates with get_class_structure / find_symbol first."
+            "Tip: omit parameterTypes to return all overloads, or inspect candidates with java_inspect(class_structure) / java_resolve(find_symbol) first."
     }
 
     private fun normalizeTypeForComparison(typeText: String): String {
@@ -239,7 +243,7 @@ class JavaPsiNavigationService(private val project: Project) {
         }
         throw IllegalArgumentException(
             "Class name '$symbolName' is ambiguous. Candidates: $formattedCandidates. " +
-                "Use a fully-qualified class name or call find_symbol first."
+                "Use a fully-qualified class name or call java_resolve with operation=find_symbol first."
         )
     }
 
@@ -340,13 +344,16 @@ class JavaPsiNavigationService(private val project: Project) {
                 .thenBy { PsiUtils.getSymbolKind(it as PsiElement) }
                 .thenBy { it.name ?: "" }
                 .thenBy { PsiUtils.getQualifiedName(it) ?: "" })
-            .take(effectiveMax)
+        val returnedCandidates = sortedCandidates.take(effectiveMax)
+        val hasMore = sortedCandidates.size > effectiveMax
 
         buildString {
             append("{")
             append("\"symbolName\":\"${PsiUtils.jsonEscape(symbolName)}\",")
-            append("\"returnedCount\":${sortedCandidates.size},")
-            append("\"candidates\":[${sortedCandidates.joinToString(",") { PsiUtils.buildSymbolCandidateJson(project, it) }}]")
+            append("\"returnedCount\":${returnedCandidates.size},")
+            append("\"maxResults\":$effectiveMax,")
+            append("\"hasMore\":$hasMore,")
+            append("\"candidates\":[${returnedCandidates.joinToString(",") { PsiUtils.buildSymbolCandidateJson(project, it) }}]")
             append("}")
         }
     }
@@ -469,10 +476,14 @@ class JavaPsiNavigationService(private val project: Project) {
 
         val references = mutableListOf<String>()
         val effectiveMax = maxResults.coerceIn(1, 200)
+        var hasMore = false
 
         // CRITICAL FIX: Use Processor returning false to actually stop iteration
         ReferencesSearch.search(targetElement as PsiElement, searchScope).forEach(Processor { ref ->
-            if (references.size >= effectiveMax) return@Processor false
+            if (references.size >= effectiveMax) {
+                hasMore = true
+                return@Processor false
+            }
 
             val element = ref.element
             val refFile = element.containingFile?.virtualFile
@@ -507,6 +518,8 @@ class JavaPsiNavigationService(private val project: Project) {
             append("\"symbolName\":\"${PsiUtils.jsonEscape(targetElement.name ?: "")}\",")
             append("\"symbolKind\":\"$symbolKind\",")
             append("\"returnedCount\":${references.size},")
+            append("\"maxResults\":$effectiveMax,")
+            append("\"hasMore\":$hasMore,")
             append("\"references\":[${references.joinToString(",")}]")
             append("}")
         }
@@ -625,17 +638,25 @@ class JavaPsiNavigationService(private val project: Project) {
         buildString {
             append("{")
             append("\"targetMethod\":\"${PsiUtils.jsonEscape(targetSignature)}\",")
-            append("\"direction\":\"${PsiUtils.jsonEscape(direction)}\"")
+            append("\"direction\":\"${PsiUtils.jsonEscape(direction)}\",")
+            append("\"maxResultsPerLevel\":$effectiveMax,")
+            append("\"limitScope\":\"per_level\"")
 
             when (direction) {
                 "callers" -> {
                     val visited = mutableSetOf(getMethodKey(method))
                     val callers = findCallers(method, effectiveDepth, effectiveMax, visited)
+                    append(",\"returnedCount\":${callers.totalReturnedCount}")
+                    append(",\"topLevelReturnedCount\":${callers.topLevelReturnedCount}")
+                    append(",\"hasMore\":${callers.hasMore}")
                     append(",\"hierarchy\":[$callers]")
                 }
                 "callees" -> {
                     val visited = mutableSetOf(getMethodKey(method))
                     val callees = findCallees(method, effectiveDepth, effectiveMax, visited)
+                    append(",\"returnedCount\":${callees.totalReturnedCount}")
+                    append(",\"topLevelReturnedCount\":${callees.topLevelReturnedCount}")
+                    append(",\"hasMore\":${callees.hasMore}")
                     append(",\"hierarchy\":[$callees]")
                 }
                 "both" -> {
@@ -643,6 +664,9 @@ class JavaPsiNavigationService(private val project: Project) {
                     val callers = findCallers(method, effectiveDepth, effectiveMax, visitedCallers)
                     val visitedCallees = mutableSetOf(getMethodKey(method))
                     val callees = findCallees(method, effectiveDepth, effectiveMax, visitedCallees)
+                    append(",\"returnedCount\":${callers.totalReturnedCount + callees.totalReturnedCount}")
+                    append(",\"topLevelReturnedCount\":${callers.topLevelReturnedCount + callees.topLevelReturnedCount}")
+                    append(",\"hasMore\":${callers.hasMore || callees.hasMore}")
                     append(",\"callers\":[$callers]")
                     append(",\"callees\":[$callees]")
                 }
@@ -653,20 +677,34 @@ class JavaPsiNavigationService(private val project: Project) {
         }
     }
 
+    private data class JsonListResult(
+        val json: String,
+        val topLevelReturnedCount: Int,
+        val totalReturnedCount: Int,
+        val hasMore: Boolean
+    ) {
+        override fun toString(): String = json
+    }
+
     private fun findCallers(
         method: PsiMethod,
         depth: Int,
         maxResults: Int,
         visited: MutableSet<String>
-    ): String {
-        if (depth <= 0) return ""
+    ): JsonListResult {
+        if (depth <= 0) return JsonListResult("", 0, 0, false)
 
         val scope = GlobalSearchScope.projectScope(project)
         val callerNodes = mutableListOf<String>()
+        var totalReturnedCount = 0
+        var hasMore = false
 
         // CRITICAL FIX: Use Processor returning false to actually stop iteration
         ReferencesSearch.search(method, scope).forEach(Processor { ref ->
-            if (callerNodes.size >= maxResults) return@Processor false
+            if (callerNodes.size >= maxResults) {
+                hasMore = true
+                return@Processor false
+            }
 
             val callerMethod = PsiTreeUtil.getParentOfType(ref.element, PsiMethod::class.java)
             if (callerMethod != null) {
@@ -681,14 +719,16 @@ class JavaPsiNavigationService(private val project: Project) {
 
                     val childCallers = if (depth > 1) {
                         findCallers(callerMethod, depth - 1, maxResults, visited)
-                    } else ""
+                    } else JsonListResult("", 0, 0, false)
+                    totalReturnedCount += 1 + childCallers.totalReturnedCount
+                    hasMore = hasMore || childCallers.hasMore
 
                     callerNodes.add(buildString {
                         append("{")
                         append("\"method\":\"${PsiUtils.jsonEscape(callerSig)}\",")
                         append("\"filePath\":\"${PsiUtils.jsonEscape(callerFile)}\",")
                         append("\"line\":$callerLine")
-                        if (childCallers.isNotEmpty()) {
+                        if (childCallers.json.isNotEmpty()) {
                             append(",\"callers\":[$childCallers]")
                         }
                         append("}")
@@ -698,7 +738,7 @@ class JavaPsiNavigationService(private val project: Project) {
             true
         })
 
-        return callerNodes.joinToString(",")
+        return JsonListResult(callerNodes.joinToString(","), callerNodes.size, totalReturnedCount, hasMore)
     }
 
     // Sentinel exception to break out of visitor traversal
@@ -709,16 +749,21 @@ class JavaPsiNavigationService(private val project: Project) {
         depth: Int,
         maxResults: Int,
         visited: MutableSet<String>
-    ): String {
-        if (depth <= 0) return ""
+    ): JsonListResult {
+        if (depth <= 0) return JsonListResult("", 0, 0, false)
 
         val calleeNodes = mutableListOf<String>()
         val projectScope = GlobalSearchScope.projectScope(project)
+        var totalReturnedCount = 0
+        var hasMore = false
 
         try {
             method.body?.accept(object : JavaRecursiveElementVisitor() {
                 override fun visitMethodCallExpression(expression: PsiMethodCallExpression) {
-                    if (calleeNodes.size >= maxResults) throw MaxResultsReachedException()
+                    if (calleeNodes.size >= maxResults) {
+                        hasMore = true
+                        throw MaxResultsReachedException()
+                    }
 
                     val resolvedMethod = expression.resolveMethod()
                     if (resolvedMethod != null) {
@@ -733,14 +778,16 @@ class JavaPsiNavigationService(private val project: Project) {
 
                                 val childCallees = if (depth > 1) {
                                     findCallees(resolvedMethod, depth - 1, maxResults, visited)
-                                } else ""
+                                } else JsonListResult("", 0, 0, false)
+                                totalReturnedCount += 1 + childCallees.totalReturnedCount
+                                hasMore = hasMore || childCallees.hasMore
 
                                 calleeNodes.add(buildString {
                                     append("{")
                                     append("\"method\":\"${PsiUtils.jsonEscape(calleeSig)}\",")
                                     append("\"filePath\":\"${PsiUtils.jsonEscape(calleeFile)}\",")
                                     append("\"line\":$calleeLine")
-                                    if (childCallees.isNotEmpty()) {
+                                    if (childCallees.json.isNotEmpty()) {
                                         append(",\"callees\":[$childCallees]")
                                     }
                                     append("}")
@@ -755,7 +802,7 @@ class JavaPsiNavigationService(private val project: Project) {
             // Expected: visitor stopped after reaching maxResults
         }
 
-        return calleeNodes.joinToString(",")
+        return JsonListResult(calleeNodes.joinToString(","), calleeNodes.size, totalReturnedCount, hasMore)
     }
 
     private fun getMethodKey(method: PsiMethod): String {
