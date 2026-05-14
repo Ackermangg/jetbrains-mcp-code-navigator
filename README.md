@@ -114,6 +114,15 @@ java_inspect(operation="class_structure", className="org.springframework.kafka.c
 2. IDEA → Settings → Plugins → ⚙️ → Install Plugin from Disk
 3. 选择 zip 文件 → 重启 IDEA
 
+发布新版本时，在本地打 `v*` 标签并推送，GitHub Actions 会自动构建插件 zip、创建 Release，并上传 `code-navigator-mcp-plugin.zip`：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+普通 push 和 PR 也会自动执行构建，可在 Actions 页面下载 `code-navigator-mcp-plugin` artifact 进行临时测试。
+
 ### 方式二：从源码构建
 
 ```bash
@@ -194,6 +203,8 @@ java_usage(operation="call_hierarchy", className="PaymentService", methodName="p
 ./gradlew runIde        # 启动沙箱 IDE 进行测试
 ./gradlew buildPlugin   # 构建插件 zip
 ```
+
+CI 使用 GitHub Actions 自动执行 `./gradlew buildPlugin -Dorg.gradle.java.home="$JAVA_HOME"`，避免受本地 `gradle.properties` 中 Windows JDK 路径影响。构建产物固定为 `build/distributions/code-navigator-mcp-plugin.zip`。
 
 ## 兼容性
 
