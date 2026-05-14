@@ -1,6 +1,7 @@
 package com.codenavigatormcp.util
 
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.module.ModuleUtilCore
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.*
 import com.intellij.psi.javadoc.PsiDocComment
@@ -28,9 +29,23 @@ object PsiUtils {
         // Fallback to short name: use project scope to avoid ambiguity across dependency JARs
         val classes = PsiShortNamesCache.getInstance(project)
             .getClassesByName(className, GlobalSearchScope.projectScope(project))
-        if (classes.isNotEmpty()) return classes[0]
+            .distinctBy { "${it.qualifiedName ?: it.name ?: className}|${it.containingFile?.virtualFile?.path ?: ""}" }
+        if (classes.size == 1) return classes[0]
+        if (classes.size > 1) {
+            throw IllegalArgumentException(buildAmbiguousClassMessage(project, className, classes))
+        }
 
         throw IllegalArgumentException("Class not found: $className")
+    }
+
+    fun buildAmbiguousClassMessage(project: Project, className: String, classes: Collection<PsiClass>): String {
+        val formattedCandidates = classes.joinToString("; ") {
+            val filePath = it.containingFile?.virtualFile?.let { file -> toProjectRelativePath(project, file) } ?: ""
+            val moduleName = getModuleName(it)
+            "${it.qualifiedName ?: it.name ?: className} [module=${moduleName.ifEmpty { "unknown" }}, file=$filePath]"
+        }
+        return "Class name '$className' is ambiguous. Candidates: $formattedCandidates. " +
+            "Use a fully-qualified class name or call java_resolve(operation=find_symbol) first."
     }
 
     fun getLineNumber(element: PsiElement): Int {
@@ -45,9 +60,19 @@ object PsiUtils {
     fun getLineRange(element: PsiElement): Pair<Int, Int> {
         val document = PsiDocumentManager.getInstance(element.project)
             .getDocument(element.containingFile) ?: return Pair(-1, -1)
-        val startLine = document.getLineNumber(element.textRange.startOffset) + 1
+        val textRange = element.textRange ?: return Pair(-1, -1)
+        if (textRange.startOffset < 0 || textRange.startOffset > document.textLength) {
+            return Pair(-1, -1)
+        }
+
+        val startLine = document.getLineNumber(textRange.startOffset) + 1
         // Use endOffset - 1 to get the last character actually in the element (endOffset is exclusive)
-        val endLine = document.getLineNumber((element.textRange.endOffset - 1).coerceAtLeast(0)) + 1
+        val endOffset = if (textRange.endOffset > textRange.startOffset) {
+            textRange.endOffset - 1
+        } else {
+            textRange.startOffset
+        }.coerceIn(0, document.textLength)
+        val endLine = document.getLineNumber(endOffset) + 1
         return Pair(startLine, endLine)
     }
 
@@ -68,6 +93,18 @@ object PsiUtils {
 
     fun getSourceType(project: Project, file: VirtualFile?): String {
         return if (isProjectFile(project, file)) "project" else "dependency"
+    }
+
+    fun getModuleName(element: PsiElement): String {
+        return ModuleUtilCore.findModuleForPsiElement(element)?.name ?: ""
+    }
+
+    fun hasAnnotation(owner: PsiModifierListOwner, shortNames: Set<String>): Boolean {
+        return owner.annotations.any { annotation ->
+            val qualifiedName = annotation.qualifiedName ?: ""
+            val shortName = qualifiedName.substringAfterLast('.').ifEmpty { annotation.nameReferenceElement?.referenceName ?: "" }
+            shortName in shortNames || qualifiedName in shortNames
+        }
     }
 
     fun getModifiers(member: PsiModifierListOwner): List<String> {
@@ -153,6 +190,7 @@ object PsiUtils {
         val qualifiedName = getQualifiedName(element) ?: ""
         val signature = getElementSignature(element)
         val sourceType = getSourceType(project, file)
+        val moduleName = getModuleName(psiElement)
 
         return buildString {
             append("{")
@@ -163,7 +201,8 @@ object PsiUtils {
             append("\"signature\":\"${jsonEscape(signature)}\",")
             append("\"filePath\":\"${jsonEscape(filePath)}\",")
             append("\"line\":$line,")
-            append("\"sourceType\":\"$sourceType\"")
+            append("\"sourceType\":\"$sourceType\",")
+            append("\"moduleName\":\"${jsonEscape(moduleName)}\"")
             append("}")
         }
     }

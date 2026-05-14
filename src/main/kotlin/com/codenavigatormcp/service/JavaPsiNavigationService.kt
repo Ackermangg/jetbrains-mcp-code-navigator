@@ -2,8 +2,14 @@ package com.codenavigatormcp.service
 
 import com.codenavigatormcp.util.PsiUtils
 import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.roots.ModuleRootManager
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.openapi.vcs.FileStatus
+import com.intellij.openapi.vcs.FileStatusManager
+import com.intellij.openapi.vcs.changes.ChangeListManager
 import com.intellij.psi.*
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.PsiShortNamesCache
@@ -237,14 +243,7 @@ class JavaPsiNavigationService(private val project: Project) {
             return allCandidates[0]
         }
 
-        val formattedCandidates = allCandidates.joinToString("; ") {
-            val filePath = it.containingFile?.virtualFile?.let { file -> PsiUtils.toProjectRelativePath(project, file) } ?: ""
-            "${it.qualifiedName ?: it.name ?: symbolName} [$filePath]"
-        }
-        throw IllegalArgumentException(
-            "Class name '$symbolName' is ambiguous. Candidates: $formattedCandidates. " +
-                "Use a fully-qualified class name or call java_resolve with operation=find_symbol first."
-        )
+        throw IllegalArgumentException(PsiUtils.buildAmbiguousClassMessage(project, symbolName, allCandidates))
     }
 
     private fun resolveElement(element: PsiElement): PsiElement? {
@@ -534,13 +533,443 @@ class JavaPsiNavigationService(private val project: Project) {
         return text.take(150).replace("\n", " ").trim()
     }
 
+    // ===== SymbolContext =====
+
+    fun getSymbolContext(
+        className: String?,
+        methodName: String?,
+        parameterTypes: List<String>?,
+        filePath: String?,
+        line: Int?,
+        column: Int?,
+        includeImports: Boolean,
+        includeFields: Boolean,
+        includeBody: Boolean,
+        nearbyLines: Int,
+        maxFields: Int?,
+        excludeLombokGenerated: Boolean
+    ): String = runReadAction {
+        val targetClass = when {
+            className != null -> PsiUtils.findClass(project, className)
+            filePath != null && line != null -> findClassAtPosition(filePath, line, column ?: 1)
+            else -> throw IllegalArgumentException("operation=symbol_context requires either className or filePath+line")
+        }
+
+        val targetMethod = when {
+            methodName != null -> {
+                var methods = targetClass.findMethodsByName(methodName, false).toList()
+                if (methods.isEmpty() && methodName == targetClass.name) {
+                    methods = targetClass.constructors.toList()
+                }
+                if (methods.isEmpty()) {
+                    throw IllegalArgumentException("Method not found: $methodName in ${targetClass.qualifiedName ?: targetClass.name}")
+                }
+                if (parameterTypes != null) {
+                    resolveMethodOverloads(methodName, methods, parameterTypes).firstOrNull()
+                } else {
+                    if (methods.size > 1) {
+                        throw IllegalArgumentException(buildSymbolContextOverloadError(methodName, methods))
+                    }
+                    methods.firstOrNull()
+                }
+            }
+            filePath != null && line != null -> findMethodAtPosition(filePath, line, column ?: 1)
+            else -> null
+        }
+
+        val containingFile = targetClass.containingFile
+        val virtualFile = containingFile.virtualFile
+        val document = PsiDocumentManager.getInstance(project).getDocument(containingFile)
+        val effectiveNearbyLines = nearbyLines.coerceIn(0, 200)
+        val sourceLines = if (document != null) {
+            buildNearbyLinesJson(document, targetMethod ?: targetClass, effectiveNearbyLines)
+        } else {
+            "[]"
+        }
+
+        val importsJson = if (includeImports) {
+            (containingFile as? PsiJavaFile)?.importList?.allImportStatements
+                ?.joinToString(",") { "\"${PsiUtils.jsonEscape(it.text)}\"" } ?: ""
+        } else {
+            null
+        }
+
+        val allFields = targetClass.fields.toList()
+        val returnedFields = maxFields?.coerceIn(0, 200)?.let { allFields.take(it) } ?: allFields
+        val fieldsJson = if (includeFields) {
+            returnedFields.joinToString(",") { field ->
+                val modifiers = PsiUtils.getModifiers(field).joinToString(",") { "\"$it\"" }
+                "{\"name\":\"${PsiUtils.jsonEscape(field.name)}\",\"type\":\"${PsiUtils.jsonEscape(field.type.presentableText)}\",\"modifiers\":[$modifiers]}"
+            }
+        } else {
+            null
+        }
+
+        val methodJson = targetMethod?.let { method ->
+            if (excludeLombokGenerated && isLombokGeneratedMethod(targetClass, method)) {
+                buildString {
+                    append("{")
+                    append("\"name\":\"${PsiUtils.jsonEscape(method.name)}\",")
+                    append("\"excluded\":true,")
+                    append("\"reason\":\"lombokGeneratedLike\"")
+                    append("}")
+                }
+            } else {
+                buildMethodJson(method, targetClass, includeBody, includeJavadoc = true)
+            }
+        }
+
+        buildString {
+            append("{")
+            append("\"operation\":\"symbol_context\",")
+            append("\"className\":\"${PsiUtils.jsonEscape(targetClass.qualifiedName ?: targetClass.name ?: "")}\",")
+            append("\"filePath\":\"${PsiUtils.jsonEscape(virtualFile?.let { PsiUtils.toProjectRelativePath(project, it) } ?: "")}\",")
+            append("\"moduleName\":\"${PsiUtils.jsonEscape(PsiUtils.getModuleName(targetClass))}\",")
+            append("\"nearbyLines\":$sourceLines")
+            if (importsJson != null) {
+                append(",\"imports\":[$importsJson]")
+            }
+            if (fieldsJson != null) {
+                append(",\"fields\":[$fieldsJson],")
+                append("\"returnedFields\":${returnedFields.size},")
+                append("\"totalFields\":${allFields.size},")
+                append("\"hasMoreFields\":${returnedFields.size < allFields.size}")
+            }
+            if (methodJson != null) {
+                append(",\"method\":$methodJson")
+            }
+            append("}")
+        }
+    }
+
+    private fun buildSymbolContextOverloadError(methodName: String, methods: List<PsiMethod>): String {
+        val candidates = methods.joinToString("; ") { method ->
+            val (startLine, endLine) = PsiUtils.getLineRange(method)
+            "${buildSignatureString(method)} [lineRange=$startLine-$endLine]"
+        }
+        return "Multiple overloads of '$methodName' matched. Pass parameterTypes to operation=symbol_context. Candidates: $candidates"
+    }
+
+    private fun findClassAtPosition(filePath: String, line: Int, column: Int): PsiClass {
+        val element = findElementAtPosition(filePath, line, column)
+        return PsiTreeUtil.getParentOfType(element, PsiClass::class.java, false)
+            ?: throw IllegalArgumentException("No Java class at $filePath:$line:$column")
+    }
+
+    private fun findMethodAtPosition(filePath: String, line: Int, column: Int): PsiMethod? {
+        val element = findElementAtPosition(filePath, line, column)
+        return PsiTreeUtil.getParentOfType(element, PsiMethod::class.java, false)
+    }
+
+    private fun findElementAtPosition(filePath: String, line: Int, column: Int): PsiElement {
+        val resolvedPath = resolveFilePath(filePath)
+        val virtualFile = LocalFileSystem.getInstance().findFileByPath(resolvedPath)
+            ?: throw IllegalArgumentException("File not found: $filePath")
+        val psiFile = PsiManager.getInstance(project).findFile(virtualFile)
+            ?: throw IllegalArgumentException("Cannot parse file: $filePath")
+        val document = PsiDocumentManager.getInstance(project).getDocument(psiFile)
+            ?: throw IllegalArgumentException("Cannot get document for: $filePath")
+
+        if (line < 1 || line > document.lineCount) {
+            throw IllegalArgumentException("Line $line out of range (1-${document.lineCount})")
+        }
+        val lineStartOffset = document.getLineStartOffset(line - 1)
+        val lineEndOffset = document.getLineEndOffset(line - 1)
+        val offset = (lineStartOffset + (column - 1)).coerceIn(lineStartOffset, lineEndOffset)
+        return psiFile.findElementAt(offset)
+            ?: throw IllegalArgumentException("No element at $filePath:$line:$column")
+    }
+
+    private fun buildNearbyLinesJson(document: com.intellij.openapi.editor.Document, element: PsiElement, nearbyLines: Int): String {
+        val (startLine, endLine) = PsiUtils.getLineRange(element)
+        val centerStart = if (startLine > 0) startLine else 1
+        val centerEnd = if (endLine > 0) endLine else centerStart
+        val fromLine = (centerStart - nearbyLines).coerceAtLeast(1)
+        val toLine = (centerEnd + nearbyLines).coerceAtMost(document.lineCount)
+        return (fromLine..toLine).joinToString(",", prefix = "[", postfix = "]") { lineNumber ->
+            val startOffset = document.getLineStartOffset(lineNumber - 1)
+            val endOffset = document.getLineEndOffset(lineNumber - 1)
+            val text = document.text.substring(startOffset, endOffset)
+            "{\"line\":$lineNumber,\"text\":\"${PsiUtils.jsonEscape(text)}\"}"
+        }
+    }
+
+    // ===== Diagnostics =====
+
+    fun getDiagnostics(
+        filePath: String?,
+        filePaths: List<String>?,
+        moduleName: String?,
+        changedOnly: Boolean,
+        maxResults: Int
+    ): String = runReadAction {
+        val effectiveMax = maxResults.coerceIn(1, 500)
+        val selection = collectDiagnosticFiles(filePath, filePaths, moduleName, changedOnly, effectiveMax)
+        val virtualFiles = selection.files
+        val problems = mutableListOf<String>()
+        var hasMore = false
+
+        for (virtualFile in virtualFiles) {
+            if (problems.size >= effectiveMax) {
+                hasMore = true
+                break
+            }
+            val psiFile = PsiManager.getInstance(project).findFile(virtualFile) ?: continue
+            val document = PsiDocumentManager.getInstance(project).getDocument(psiFile)
+            try {
+                psiFile.accept(object : JavaRecursiveElementWalkingVisitor() {
+                    override fun visitErrorElement(element: PsiErrorElement) {
+                        if (problems.size >= effectiveMax) {
+                            hasMore = true
+                            throw DiagnosticLimitReachedException()
+                        }
+                        val offset = element.textOffset
+                        val line = if (document != null && offset >= 0 && offset <= document.textLength) {
+                            document.getLineNumber(offset) + 1
+                        } else {
+                            -1
+                        }
+                        problems.add(buildString {
+                            append("{")
+                            append("\"severity\":\"ERROR\",")
+                            append("\"filePath\":\"${PsiUtils.jsonEscape(PsiUtils.toProjectRelativePath(project, virtualFile))}\",")
+                            append("\"line\":$line,")
+                            append("\"description\":\"${PsiUtils.jsonEscape(element.errorDescription)}\"")
+                            append("}")
+                        })
+                        if (problems.size >= effectiveMax) {
+                            hasMore = true
+                            throw DiagnosticLimitReachedException()
+                        }
+                    }
+                })
+            } catch (_: DiagnosticLimitReachedException) {
+                break
+            }
+        }
+
+        val missingFilesJson = selection.missingPaths.joinToString(",") { "\"${PsiUtils.jsonEscape(it)}\"" }
+        val skippedFilesJson = selection.skippedPaths.joinToString(",") { "\"${PsiUtils.jsonEscape(it)}\"" }
+        val inputProblemCount = selection.missingPaths.size + selection.skippedPaths.size
+
+        buildString {
+            append("{")
+            append("\"operation\":\"diagnostics\",")
+            append("\"diagnosticSource\":\"java_psi_parse_errors\",")
+            append("\"scope\":\"${PsiUtils.jsonEscape(describeDiagnosticScope(filePath, filePaths, moduleName, changedOnly))}\",")
+            append("\"checkedFiles\":${virtualFiles.size},")
+            append("\"returnedCount\":${problems.size},")
+            append("\"maxResults\":$effectiveMax,")
+            append("\"hasMore\":$hasMore,")
+            append("\"inputValid\":${inputProblemCount == 0},")
+            append("\"inputProblemCount\":$inputProblemCount,")
+            append("\"missingFiles\":[$missingFilesJson],")
+            append("\"skippedFiles\":[$skippedFilesJson],")
+            append("\"problems\":[${problems.joinToString(",")}]")
+            append("}")
+        }
+    }
+
+    private data class DiagnosticFileSelection(
+        val files: List<VirtualFile>,
+        val missingPaths: List<String> = emptyList(),
+        val skippedPaths: List<String> = emptyList()
+    )
+
+    private fun collectDiagnosticFiles(
+        filePath: String?,
+        filePaths: List<String>?,
+        moduleName: String?,
+        changedOnly: Boolean,
+        fileLimit: Int
+    ): DiagnosticFileSelection {
+        val explicitPaths = buildList {
+            if (filePath != null) add(filePath)
+            if (filePaths != null) addAll(filePaths)
+        }
+        if (explicitPaths.isNotEmpty()) {
+            val files = mutableListOf<VirtualFile>()
+            val missingPaths = mutableListOf<String>()
+            val skippedPaths = mutableListOf<String>()
+            explicitPaths.forEach { path ->
+                val virtualFile = LocalFileSystem.getInstance().findFileByPath(resolveFilePath(path))
+                when {
+                    virtualFile == null -> missingPaths.add(path)
+                    virtualFile.extension != "java" -> skippedPaths.add(path)
+                    else -> files.add(virtualFile)
+                }
+            }
+            return DiagnosticFileSelection(
+                files = files.distinctBy { it.path },
+                missingPaths = missingPaths,
+                skippedPaths = skippedPaths
+            )
+        }
+
+        if (changedOnly) {
+            val changeListManager = ChangeListManager.getInstance(project)
+            val fileStatusManager = FileStatusManager.getInstance(project)
+            return DiagnosticFileSelection(changeListManager.affectedFiles
+                .asSequence()
+                .filter { it.extension == "java" }
+                .filter { fileStatusManager.getStatus(it) != FileStatus.NOT_CHANGED }
+                .distinctBy { it.path }
+                .take(fileLimit)
+                .toList())
+        }
+
+        if (moduleName != null) {
+            val module = ModuleManager.getInstance(project).modules.firstOrNull { it.name == moduleName }
+                ?: throw IllegalArgumentException("Module not found: $moduleName")
+            val sourceRoots = ModuleRootManager.getInstance(module).sourceRoots.toList()
+            return DiagnosticFileSelection(collectJavaFiles(sourceRoots, fileLimit).distinctBy { it.path })
+        }
+
+        throw IllegalArgumentException("operation=diagnostics requires filePath, filePaths, moduleName, or changedOnly=true")
+    }
+
+    private fun collectJavaFiles(roots: List<VirtualFile>, fileLimit: Int): List<VirtualFile> {
+        val files = mutableListOf<VirtualFile>()
+        fun visit(file: VirtualFile) {
+            if (files.size >= fileLimit) return
+            if (file.isDirectory) {
+                file.children.forEach(::visit)
+            } else if (file.extension == "java") {
+                files.add(file)
+            }
+        }
+        roots.forEach(::visit)
+        return files
+    }
+
+    private fun describeDiagnosticScope(
+        filePath: String?,
+        filePaths: List<String>?,
+        moduleName: String?,
+        changedOnly: Boolean
+    ): String {
+        return when {
+            filePath != null || !filePaths.isNullOrEmpty() -> "files"
+            changedOnly -> "changed_files"
+            moduleName != null -> "module:$moduleName"
+            else -> "unspecified"
+        }
+    }
+
+    // ===== MapStructMappings =====
+
+    fun getMapperMappings(className: String): String = runReadAction {
+        val psiClass = PsiUtils.findClass(project, className)
+        val isMapper = hasExactAnnotation(psiClass, "org.mapstruct.Mapper")
+        val methods = psiClass.methods.toList()
+        val methodJson = methods.joinToString(",") { method -> buildMapperMethodJson(method) }
+
+        buildString {
+            append("{")
+            append("\"operation\":\"mapper_mappings\",")
+            append("\"className\":\"${PsiUtils.jsonEscape(psiClass.qualifiedName ?: psiClass.name ?: className)}\",")
+            append("\"moduleName\":\"${PsiUtils.jsonEscape(PsiUtils.getModuleName(psiClass))}\",")
+            append("\"mapStructMapper\":$isMapper,")
+            append("\"generatedImplementationChecked\":false,")
+            append("\"note\":\"Static annotation summary only; run Maven or IDE build to validate generated MapStruct implementation and Lombok-generated accessors.\",")
+            append("\"methods\":[$methodJson]")
+            append("}")
+        }
+    }
+
+    private fun buildMapperMethodJson(method: PsiMethod): String {
+        val mappingAnnotations = method.annotations.filter { isMapStructMappingAnnotation(it) }
+        val flattenedMappings = mappingAnnotations.flatMap { flattenMapStructAnnotation(it) }
+        val mappingsJson = flattenedMappings.joinToString(",")
+        return buildString {
+            append("{")
+            append("\"name\":\"${PsiUtils.jsonEscape(method.name)}\",")
+            append("\"signature\":\"${PsiUtils.jsonEscape(buildSignatureString(method))}\",")
+            append("\"returnType\":\"${PsiUtils.jsonEscape(method.returnType?.presentableText ?: "void")}\",")
+            append("\"parameters\":[")
+            append(method.parameterList.parameters.joinToString(",") {
+                "{\"name\":\"${PsiUtils.jsonEscape(it.name)}\",\"type\":\"${PsiUtils.jsonEscape(it.type.presentableText)}\"}"
+            })
+            append("],")
+            append("\"mappingAnnotationCount\":${flattenedMappings.size},")
+            append("\"mappings\":[$mappingsJson]")
+            append("}")
+        }
+    }
+
+    private fun isMapStructMappingAnnotation(annotation: PsiAnnotation): Boolean {
+        return annotation.qualifiedName in setOf(
+            "org.mapstruct.Mapping",
+            "org.mapstruct.Mappings",
+            "org.mapstruct.BeanMapping"
+        )
+    }
+
+    private fun flattenMapStructAnnotation(annotation: PsiAnnotation): List<String> {
+        return when (annotation.qualifiedName) {
+            "org.mapstruct.Mappings" -> {
+                val value = annotation.findAttributeValue("value")
+                when (value) {
+                    is PsiArrayInitializerMemberValue -> value.initializers
+                        .filterIsInstance<PsiAnnotation>()
+                        .filter { it.qualifiedName == "org.mapstruct.Mapping" }
+                        .map { buildMapStructAnnotationJson(it) }
+                    is PsiAnnotation -> if (value.qualifiedName == "org.mapstruct.Mapping") {
+                        listOf(buildMapStructAnnotationJson(value))
+                    } else {
+                        emptyList()
+                    }
+                    else -> listOf(buildMapStructAnnotationJson(annotation))
+                }
+            }
+            else -> listOf(buildMapStructAnnotationJson(annotation))
+        }
+    }
+
+    private fun buildMapStructAnnotationJson(annotation: PsiAnnotation): String {
+        val attributes = annotation.parameterList.attributes.joinToString(",") { attribute ->
+            val name = attribute.name ?: "value"
+            "\"${PsiUtils.jsonEscape(name)}\":\"${PsiUtils.jsonEscape(unquoteAnnotationValue(attribute.value?.text ?: ""))}\""
+        }
+        val annotationName = annotation.qualifiedName?.substringAfterLast('.')
+            ?: annotation.nameReferenceElement?.referenceName
+            ?: ""
+        return buildString {
+            append("{")
+            append("\"annotation\":\"${PsiUtils.jsonEscape(annotationName)}\",")
+            append("\"attributes\":{$attributes}")
+            append("}")
+        }
+    }
+
+    private fun unquoteAnnotationValue(text: String): String {
+        val trimmed = text.trim()
+        return if (trimmed.length >= 2 && trimmed.first() == '"' && trimmed.last() == '"') {
+            trimmed.substring(1, trimmed.length - 1)
+        } else {
+            trimmed
+        }
+    }
+
+    private fun hasExactAnnotation(owner: PsiModifierListOwner, qualifiedName: String): Boolean {
+        return owner.annotations.any { it.qualifiedName == qualifiedName }
+    }
+
+    private class DiagnosticLimitReachedException : RuntimeException()
+
     // ===== GetClassStructure =====
 
     fun getClassStructure(
         className: String,
         includeFields: Boolean,
         includeMethods: Boolean,
-        includeInherited: Boolean
+        includeInherited: Boolean,
+        maxFields: Int?,
+        maxMethods: Int?,
+        methodNamePattern: String?,
+        methodVisibility: String?,
+        excludeSynthetic: Boolean,
+        excludeLombokGenerated: Boolean
     ): String = runReadAction {
         val psiClass = PsiUtils.findClass(project, className)
         val filePath = psiClass.containingFile?.virtualFile?.let {
@@ -550,6 +979,7 @@ class JavaPsiNavigationService(private val project: Project) {
         val parts = mutableListOf<String>()
         parts.add("\"className\":\"${PsiUtils.jsonEscape(psiClass.qualifiedName ?: psiClass.name ?: "")}\"")
         parts.add("\"filePath\":\"${PsiUtils.jsonEscape(filePath)}\"")
+        parts.add("\"moduleName\":\"${PsiUtils.jsonEscape(PsiUtils.getModuleName(psiClass))}\"")
         parts.add("\"superClass\":${psiClass.superClass?.qualifiedName?.let { "\"${PsiUtils.jsonEscape(it)}\"" } ?: "null"}")
 
         // Interfaces
@@ -564,12 +994,14 @@ class JavaPsiNavigationService(private val project: Project) {
 
         // Fields
         if (includeFields) {
-            val fields = if (includeInherited) {
+            val allFields = if (includeInherited) {
                 psiClass.allFields.filter { it.containingClass?.qualifiedName != "java.lang.Object" }
             } else {
                 psiClass.fields.toList()
             }
-            val fieldsJson = fields.joinToString(",") { field ->
+            val effectiveMaxFields = maxFields?.coerceIn(0, 500)
+            val returnedFields = effectiveMaxFields?.let { allFields.take(it) } ?: allFields
+            val fieldsJson = returnedFields.joinToString(",") { field ->
                 val fieldAnnotations = field.annotations.joinToString(",") {
                     "\"${PsiUtils.jsonEscape(it.qualifiedName?.substringAfterLast('.') ?: "")}\""
                 }
@@ -577,33 +1009,31 @@ class JavaPsiNavigationService(private val project: Project) {
                 "{\"name\":\"${PsiUtils.jsonEscape(field.name)}\",\"type\":\"${PsiUtils.jsonEscape(field.type.presentableText)}\",\"modifiers\":[$fieldModifiers],\"annotations\":[$fieldAnnotations]}"
             }
             parts.add("\"fields\":[$fieldsJson]")
+            parts.add("\"returnedFields\":${returnedFields.size}")
+            parts.add("\"hasMoreFields\":${effectiveMaxFields != null && allFields.size > effectiveMaxFields}")
         }
 
         // Methods
         if (includeMethods) {
-            val methods = if (includeInherited) {
+            val allMethods = if (includeInherited) {
                 psiClass.allMethods.filter { it.containingClass?.qualifiedName != "java.lang.Object" }
             } else {
                 psiClass.methods.toList()
             }
-            val methodsJson = methods.joinToString(",") { method ->
-                val (mStart, mEnd) = PsiUtils.getLineRange(method)
-                val javadoc = method.docComment?.let { PsiUtils.extractJavadocSummary(it) }
-                val params = method.parameterList.parameters.joinToString(",") { "\"${PsiUtils.jsonEscape(it.type.presentableText)}\"" }
-                val modifiers = PsiUtils.getModifiers(method).joinToString(",") { "\"$it\"" }
-                buildString {
-                    append("{\"name\":\"${PsiUtils.jsonEscape(method.name)}\",")
-                    append("\"returnType\":\"${PsiUtils.jsonEscape(method.returnType?.presentableText ?: "void")}\",")
-                    append("\"parameters\":[$params],")
-                    append("\"modifiers\":[$modifiers],")
-                    append("\"lineRange\":{\"start\":$mStart,\"end\":$mEnd}")
-                    if (javadoc != null) {
-                        append(",\"javadoc\":\"${PsiUtils.jsonEscape(javadoc)}\"")
-                    }
-                    append("}")
-                }
-            }
+            val nameRegex = methodNamePattern?.let { Regex(it) }
+            val visibility = methodVisibility?.lowercase()
+            val filteredMethods = allMethods
+                .filter { method -> nameRegex?.containsMatchIn(method.name) ?: true }
+                .filter { method -> visibility == null || getMethodVisibility(method) == visibility }
+                .filter { method -> !excludeSynthetic || !isSyntheticLikeMethod(method) }
+                .filter { method -> !excludeLombokGenerated || !isLombokGeneratedMethod(psiClass, method) }
+            val effectiveMaxMethods = maxMethods?.coerceIn(0, 500)
+            val returnedMethods = effectiveMaxMethods?.let { filteredMethods.take(it) } ?: filteredMethods
+            val methodsJson = returnedMethods.joinToString(",") { method -> buildClassStructureMethodJson(psiClass, method) }
             parts.add("\"methods\":[$methodsJson]")
+            parts.add("\"returnedMethods\":${returnedMethods.size}")
+            parts.add("\"filteredMethods\":${filteredMethods.size}")
+            parts.add("\"hasMoreMethods\":${effectiveMaxMethods != null && filteredMethods.size > effectiveMaxMethods}")
         }
 
         // Stats
@@ -616,6 +1046,134 @@ class JavaPsiNavigationService(private val project: Project) {
         }
 
         "{${parts.joinToString(",")}}"
+    }
+
+    private fun buildClassStructureMethodJson(psiClass: PsiClass, method: PsiMethod): String {
+        val (mStart, mEnd) = PsiUtils.getLineRange(method)
+        val javadoc = method.docComment?.let { PsiUtils.extractJavadocSummary(it) }
+        val params = method.parameterList.parameters.joinToString(",") { "\"${PsiUtils.jsonEscape(it.type.presentableText)}\"" }
+        val modifiers = PsiUtils.getModifiers(method).joinToString(",") { "\"$it\"" }
+        return buildString {
+            append("{\"name\":\"${PsiUtils.jsonEscape(method.name)}\",")
+            append("\"returnType\":\"${PsiUtils.jsonEscape(method.returnType?.presentableText ?: "void")}\",")
+            append("\"parameters\":[$params],")
+            append("\"modifiers\":[$modifiers],")
+            append("\"visibility\":\"${getMethodVisibility(method)}\",")
+            append("\"syntheticLike\":${isSyntheticLikeMethod(method)},")
+            append("\"lombokGeneratedLike\":${isLombokGeneratedMethod(psiClass, method)},")
+            append("\"lineRange\":{\"start\":$mStart,\"end\":$mEnd}")
+            if (javadoc != null) {
+                append(",\"javadoc\":\"${PsiUtils.jsonEscape(javadoc)}\"")
+            }
+            append("}")
+        }
+    }
+
+    private fun getMethodVisibility(method: PsiMethod): String {
+        return when {
+            method.hasModifierProperty(PsiModifier.PUBLIC) -> "public"
+            method.hasModifierProperty(PsiModifier.PROTECTED) -> "protected"
+            method.hasModifierProperty(PsiModifier.PRIVATE) -> "private"
+            else -> "package"
+        }
+    }
+
+    private fun isSyntheticLikeMethod(method: PsiMethod): Boolean {
+        val (startLine, endLine) = PsiUtils.getLineRange(method)
+        return startLine < 1 || endLine < 1 || method.containingFile?.virtualFile == null
+    }
+
+    private fun isLombokGeneratedMethod(psiClass: PsiClass, method: PsiMethod): Boolean {
+        if (method.docComment != null) return false
+
+        val (startLine, endLine) = PsiUtils.getLineRange(method)
+        val hasUnreliableSourceLocation = startLine <= 1 && endLine <= 1
+        if (method.isConstructor) {
+            return hasUnreliableSourceLocation && hasLombokConstructorAnnotation(psiClass)
+        }
+
+        if (method.parameterList.parametersCount == 0 && method.name.startsWith("get") && method.name.length > 3) {
+            return hasUnreliableSourceLocation && hasLombokGetterAnnotation(psiClass, getterFieldName(method.name))
+        }
+        if (method.parameterList.parametersCount == 0 && method.name.startsWith("is") && method.name.length > 2) {
+            return hasUnreliableSourceLocation && hasLombokGetterAnnotation(psiClass, booleanGetterFieldName(method.name))
+        }
+        if (method.parameterList.parametersCount == 1 && method.name.startsWith("set") && method.name.length > 3) {
+            return hasUnreliableSourceLocation && hasLombokSetterAnnotation(psiClass, setterFieldName(method.name))
+        }
+        return hasUnreliableSourceLocation &&
+            method.name in setOf("toString", "equals", "hashCode", "canEqual") &&
+            hasLombokValueLikeAnnotation(psiClass)
+    }
+
+    private fun hasLombokConstructorAnnotation(psiClass: PsiClass): Boolean {
+        return PsiUtils.hasAnnotation(
+            psiClass,
+            setOf(
+                "lombok.Data", "Data",
+                "lombok.Value", "Value",
+                "lombok.Builder", "Builder",
+                "lombok.AllArgsConstructor", "AllArgsConstructor",
+                "lombok.NoArgsConstructor", "NoArgsConstructor",
+                "lombok.RequiredArgsConstructor", "RequiredArgsConstructor"
+            )
+        )
+    }
+
+    private fun hasLombokValueLikeAnnotation(psiClass: PsiClass): Boolean {
+        return PsiUtils.hasAnnotation(
+            psiClass,
+            setOf(
+                "lombok.Data", "Data",
+                "lombok.Value", "Value"
+            )
+        )
+    }
+
+    private fun hasLombokGetterAnnotation(psiClass: PsiClass, fieldName: String): Boolean {
+        return PsiUtils.hasAnnotation(
+            psiClass,
+            setOf(
+                "lombok.Data", "Data",
+                "lombok.Getter", "Getter",
+                "lombok.Value", "Value"
+            )
+        ) || hasFieldAnnotation(psiClass, fieldName, setOf("lombok.Getter", "Getter"))
+    }
+
+    private fun hasLombokSetterAnnotation(psiClass: PsiClass, fieldName: String): Boolean {
+        return PsiUtils.hasAnnotation(
+            psiClass,
+            setOf(
+                "lombok.Data", "Data",
+                "lombok.Setter", "Setter"
+            )
+        ) || hasFieldAnnotation(psiClass, fieldName, setOf("lombok.Setter", "Setter"))
+    }
+
+    private fun hasFieldAnnotation(psiClass: PsiClass, fieldName: String, annotations: Set<String>): Boolean {
+        val field = psiClass.findFieldByName(fieldName, false) ?: return false
+        return PsiUtils.hasAnnotation(field, annotations)
+    }
+
+    private fun getterFieldName(methodName: String): String {
+        return decapitalizePropertyName(methodName.removePrefix("get"))
+    }
+
+    private fun booleanGetterFieldName(methodName: String): String {
+        return decapitalizePropertyName(methodName.removePrefix("is"))
+    }
+
+    private fun setterFieldName(methodName: String): String {
+        return decapitalizePropertyName(methodName.removePrefix("set"))
+    }
+
+    private fun decapitalizePropertyName(propertyName: String): String {
+        if (propertyName.isEmpty()) return propertyName
+        if (propertyName.length > 1 && propertyName[0].isUpperCase() && propertyName[1].isUpperCase()) {
+            return propertyName
+        }
+        return propertyName.replaceFirstChar { it.lowercase() }
     }
 
     // ===== CallHierarchy =====

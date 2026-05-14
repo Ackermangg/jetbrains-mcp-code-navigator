@@ -51,21 +51,38 @@ java_inspect(operation="class_structure", className="org.springframework.kafka.c
 返回值包含 `returnedCount`、`maxResults`、`hasMore` 和 `candidates`。`hasMore=true` 表示结果被截断，需要提高 `maxResults` 或收窄查询条件。
 
 ### `java_inspect`
-读取类结构或方法代码，合并原 `get_class_structure` 和 `get_method_body` 能力。**支持项目源码和 Maven 依赖 JAR 中的类。**
+读取类结构、方法代码、窄上下文、限定范围诊断或 MapStruct 映射摘要，合并原 `get_class_structure` 和 `get_method_body` 能力。**支持项目源码和 Maven 依赖 JAR 中的类。**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `operation` | string | ✅ | `class_structure` 或 `method_body` |
-| `className` | string | ✅ | 类名（短名或全限定名） |
-| `methodName` | string | 视模式 | `method_body` 时必填 |
-| `parameterTypes` | string[] | — | `method_body` 时用于区分重载方法；不传则返回所有同名重载 |
-| `includeBody` | boolean | — | `method_body` 时是否包含方法体，默认 `false`；设为 `true` 返回方法体 |
+| `operation` | string | ✅ | `class_structure` / `method_body` / `symbol_context` / `diagnostics` / `mapper_mappings` |
+| `className` | string | 视模式 | 类名（短名或全限定名）；类/方法/MapStruct 查询时使用 |
+| `methodName` | string | 视模式 | `method_body` 必填；`symbol_context` 可选 |
+| `parameterTypes` | string[] | — | `method_body` 时用于区分重载方法；`symbol_context` 遇到重载时必须传入 |
+| `includeBody` | boolean | — | `method_body` / `symbol_context` 时是否包含方法体，默认 `false` |
 | `includeJavadoc` | boolean | — | `method_body` 时是否包含 Javadoc，默认 `true` |
-| `includeFields` | boolean | — | `class_structure` 时是否包含字段，默认 `true` |
+| `includeFields` | boolean | — | `class_structure` / `symbol_context` 时是否包含字段，默认 `true` |
 | `includeMethods` | boolean | — | `class_structure` 时是否包含方法签名，默认 `true` |
 | `includeInherited` | boolean | — | `class_structure` 时是否包含继承成员，默认 `false` |
+| `maxFields` / `maxMethods` | int | — | `class_structure` / `symbol_context` 的字段或方法返回上限 |
+| `methodNamePattern` | string | — | `class_structure` 方法名正则过滤 |
+| `methodVisibility` | string | — | `class_structure` 方法可见性过滤：`public` / `protected` / `private` / `package` |
+| `excludeSynthetic` | boolean | — | `class_structure` 是否过滤无可靠源码位置的 synthetic/light 方法 |
+| `excludeLombokGenerated` | boolean | — | `class_structure` / `symbol_context` 是否过滤 Lombok 生成风格方法 |
+| `filePath` / `line` / `column` | string / int / int | 视模式 | `symbol_context` 按位置读取或 `diagnostics` 查单文件 |
+| `filePaths` | string[] | — | `diagnostics` 查多个文件 |
+| `changedOnly` | boolean | — | `diagnostics` 只查 VCS 改动 Java 文件 |
+| `moduleName` | string | — | `diagnostics` 查指定模块源码根 |
+| `nearbyLines` | int | — | `symbol_context` 附近源码行数，默认 20 |
+| `maxResults` | int | — | `diagnostics` 问题返回上限 |
 
 `method_body` 返回值固定为对象，方法结果始终放在 `methods` 数组中；单个重载和多个重载的结构一致。
+
+`symbol_context` 如果 `methodName` 命中多个重载且未传 `parameterTypes`，会返回错误并列出候选签名，避免静默读取错误重载。
+
+`diagnostics` 返回的是 IntelliJ PSI parse error 摘要，适合快速确认指定文件/模块/本次改动文件是否有语法或解析错误；它不等价于 Maven 编译，也不验证 MapStruct/Lombok 生成代码。显式传入的缺失文件和非 Java 文件会通过 `missingFiles` / `skippedFiles` 返回，并将 `inputValid` 标为 `false`。
+
+`mapper_mappings` 只汇总可解析到 `org.mapstruct.*` 的 MapStruct 注解和方法签名，并在返回中标记 `generatedImplementationChecked=false`；生成实现和 Lombok accessor 是否真实可编译仍需 Maven 或 IDE build 验证。
 
 ### `java_usage`
 分析引用和调用链，合并原 `find_references` 和 `call_hierarchy` 能力。
@@ -151,6 +168,18 @@ java_inspect(operation="method_body", className="cn.hutool.core.util.StrUtil", m
 
 # 获取类结构概览，快速了解有哪些方法（支持 JAR 中的类）
 java_inspect(operation="class_structure", className="org.springframework.kafka.core.KafkaTemplate")
+
+# 大类只看字段和前 20 个非 Lombok/synthetic 方法
+java_inspect(operation="class_structure", className="Stowage", maxMethods=20, excludeLombokGenerated=true, excludeSynthetic=true)
+
+# 读取指定方法的窄上下文：imports、字段、方法签名和附近源码行
+java_inspect(operation="symbol_context", className="OrderService", methodName="createOrder", nearbyLines=20)
+
+# 只检查本次改动 Java 文件的 PSI 解析错误
+java_inspect(operation="diagnostics", changedOnly=true)
+
+# 汇总 MapStruct mapper 上的 @Mapping / @Mappings / @BeanMapping 注解
+java_inspect(operation="mapper_mappings", className="OrderMapper")
 
 # 精确查找某方法的所有调用点
 java_usage(operation="find_references", className="OrderService", methodName="createOrder")
